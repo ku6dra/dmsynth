@@ -37,6 +37,12 @@ class MidiInput
     void Close();
     bool IsOpen() const { return m_hMidiIn != nullptr; }
 
+    // timeGetTime() captured immediately after midiInStart. Adding this to
+    // the DWORD timestamp from the MIDI callback yields a timestamp in the
+    // absolute timeGetTime() domain, which can then be compared against
+    // timeGetTime()/latency-clock samples taken elsewhere.
+    DWORD GetStartTimeMs() const { return m_startTimeMs; }
+
     void SetCallback(MidiCallback cb) { m_callback = std::move(cb); }
     void SetSysExCallback(MidiSysExCallback cb) { m_sysExCallback = std::move(cb); }
 
@@ -48,11 +54,13 @@ class MidiInput
     void HandleSysEx(MIDIHDR* pHeader, DWORD_PTR dwParam2);
     void PrepareSysExBuffers();
     void UnprepareSysExBuffers();
+    void EnsureCallbackThreadBoosted();
 
     HMIDIIN m_hMidiIn = nullptr;
     std::atomic<bool> m_closing{false};
     MidiCallback m_callback;
     MidiSysExCallback m_sysExCallback;
+    DWORD m_startTimeMs = 0;
 
     // MMCSS (Multimedia Class Scheduler Service)
     HANDLE m_mmcssHandle = nullptr;

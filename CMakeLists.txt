@@ -36,3 +36,10 @@ target_compile_definitions(dm_synth PRIVATE
     UNICODE
     _UNICODE
 )
+
+# Optional: log every timestamp sent to DirectMusic. Off by default so Release
+# builds don't carry the branch. Enable with: cmake .. -DDMSYNTH_DEBUG_TIMESTAMPS=ON
+option(DMSYNTH_DEBUG_TIMESTAMPS "Print DirectMusic timestamps for every MIDI/SysEx message" OFF)
+if(DMSYNTH_DEBUG_TIMESTAMPS)
+    target_compile_definitions(dm_synth PRIVATE DMSYNTH_DEBUG_TIMESTAMPS=1)
+endif()

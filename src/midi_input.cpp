@@ -47,6 +47,10 @@ bool MidiInput::Open(UINT deviceId)
     PrepareSysExBuffers();
 
     result = midiInStart(m_hMidiIn);
+    // Capture timeGetTime() as close to midiInStart() as possible so callers
+    // can convert midiInProc's dwParam2 (ms since midiInStart) back to the
+    // absolute timeGetTime() domain.
+    m_startTimeMs = timeGetTime();
     if (result != MMSYSERR_NOERROR)
     {
         wchar_t errMsg[256];
@@ -136,13 +140,27 @@ void CALLBACK MidiInput::MidiInProc(HMIDIIN hMidiIn, UINT wMsg, DWORD_PTR dwInst
     }
 }
 
+void MidiInput::EnsureCallbackThreadBoosted()
+{
+    if (m_mmcssHandle)
+        return;
+
+    DWORD taskIndex = 0;
+    m_mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+    if (m_mmcssHandle)
+    {
+        // Highest priority documented for Pro Audio under MMCSS.
+        AvSetMmThreadPriority(m_mmcssHandle, AVRT_PRIORITY_CRITICAL);
+    }
+    // Belt-and-braces: also pin the OS thread priority to TIME_CRITICAL so
+    // core-parking / scheduler quirks are less likely to deschedule us mid-
+    // callback. CPU use is well under 1%, so starvation risk is negligible.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+}
+
 void MidiInput::HandleShortMessage(DWORD_PTR dwParam1, DWORD_PTR dwParam2)
 {
-    if (!m_mmcssHandle)
-    {
-        DWORD taskIndex = 0;
-        m_mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
-    }
+    EnsureCallbackThreadBoosted();
 
     uint8_t status = static_cast<uint8_t>(dwParam1 & 0xFF);
 
@@ -166,16 +184,27 @@ void MidiInput::HandleSysEx(MIDIHDR* pHeader, DWORD_PTR dwParam2)
     if (m_closing)
         return;
 
-    if (!m_mmcssHandle)
-    {
-        DWORD taskIndex = 0;
-        m_mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
-    }
+    EnsureCallbackThreadBoosted();
 
     if (pHeader->dwBytesRecorded > 0 && m_sysExCallback)
     {
-        m_sysExCallback(reinterpret_cast<const uint8_t*>(pHeader->lpData), pHeader->dwBytesRecorded,
-                        static_cast<DWORD>(dwParam2));
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(pHeader->lpData);
+        DWORD len = pHeader->dwBytesRecorded;
+
+        // Validate framing: well-formed SysEx starts with F0, ends with F7,
+        // and fits in the prepared buffer. Malformed packets (driver bug,
+        // noisy cable, truncated stream) are dropped here so downstream
+        // never sees a half-message.
+        bool framingOk = (len <= SYSEX_BUFFER_SIZE) && (data[0] == 0xF0) && (data[len - 1] == 0xF7);
+        if (framingOk)
+        {
+            m_sysExCallback(data, len, static_cast<DWORD>(dwParam2));
+        }
+        else
+        {
+            fwprintf(stderr, L"[MIDI] Dropped malformed SysEx (%lu bytes, first=0x%02X last=0x%02X)\n", len,
+                     len > 0 ? data[0] : 0, len > 0 ? data[len - 1] : 0);
+        }
     }
 
     // Re-queue the buffer for more SysEx data

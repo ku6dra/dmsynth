@@ -1,6 +1,8 @@
 #include <initguid.h>
 #include "dm_synth.h"
 #include <dsound.h>
+#include <mmsystem.h>
+#include <algorithm>
 #include <cstring>
 
 // XG Reverb Type (MSB, LSB) → GS Reverb Macro type
@@ -190,6 +192,13 @@ bool DmSynth::CreateSynthPort(const GUID& portGuid, const SynthConfig& config)
     if (!m_initialized)
         return false;
 
+    if (m_pLatencyClock)
+    {
+        m_pLatencyClock->Release();
+        m_pLatencyClock = nullptr;
+    }
+    m_anchorInitialized = false;
+
     if (m_pPort)
     {
         m_pPort->Release();
@@ -301,11 +310,260 @@ bool DmSynth::CreateSynthPort(const GUID& portGuid, const SynthConfig& config)
         return false;
     }
 
+    // Acquire the port's latency clock so we can stamp MIDI buffers with a
+    // reference-time that tracks actual arrival order rather than 0.
+    if (FAILED(m_pPort->GetLatencyClock(&m_pLatencyClock)))
+    {
+        m_pLatencyClock = nullptr;
+    }
+
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         SendDefaultEffects();
     }
     return true;
+}
+
+REFERENCE_TIME DmSynth::MidiMsToRefTime(DWORD absWinmmMs)
+{
+    if (!m_pLatencyClock)
+        return 0;
+
+    // Serialize anchor state against concurrent MIDI-in threads (e.g. port 2).
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // Anchor once at the first message and hold it for the lifetime of the
+    // port. Re-anchoring on silence was causing audible ~15 ms cbDelay
+    // shifts per re-anchor because every fresh sample baked in a new ε
+    // (the time between the timeGetTime and latency-clock reads, plus any
+    // preemption). A stationary anchor converts that ε into a constant
+    // per-session offset instead, which is inaudible. DWORD wrap of
+    // timeGetTime (~49.7 days) is handled by the signed delta below.
+    if (!m_anchorInitialized)
+    {
+        // Sandwich the latency-clock read between two timeGetTime() calls
+        // and keep the sample with the smallest span. The latency clock was
+        // read at some unknown point between w1 and w2, so midpoint is the
+        // best estimate; the remaining error is bounded by (w2 - w1) / 2.
+        //
+        // Without this, a preempted GetTime() call (seen as large as ~16 ms
+        // under load) gets baked into the anchor as a constant bias on every
+        // subsequent lead computation — that is what was changing between
+        // re-anchors.
+        const int kAttempts = 8;
+        DWORD bestSpan = 0xFFFFFFFFu;
+        DWORD bestWinmm = 0;
+        REFERENCE_TIME bestRt = 0;
+        bool got = false;
+        for (int i = 0; i < kAttempts; i++)
+        {
+            DWORD w1 = timeGetTime();
+            REFERENCE_TIME rt = 0;
+            if (FAILED(m_pLatencyClock->GetTime(&rt)))
+                continue;
+            DWORD w2 = timeGetTime();
+            DWORD span = w2 - w1;
+            if (!got || span < bestSpan)
+            {
+                bestSpan = span;
+                bestWinmm = w1 + span / 2;
+                bestRt = rt;
+                got = true;
+                if (span == 0)
+                    break; // cannot do better at 1 ms resolution
+            }
+        }
+        if (!got)
+            return 0;
+
+        m_winmmAnchorMs = bestWinmm;
+        m_refAnchor = bestRt;
+        m_anchorInitialized = true;
+    }
+
+    // Signed delta handles DWORD wrap (~49.7 days) correctly.
+    int32_t deltaMs = static_cast<int32_t>(absWinmmMs - m_winmmAnchorMs);
+    return m_refAnchor + static_cast<REFERENCE_TIME>(deltaMs) * 10000 + m_schedulingLead;
+}
+
+HRESULT DmSynth::PackStructuredWithRetry(REFERENCE_TIME rt, uint32_t group, DWORD msg)
+{
+    HRESULT hr = m_pMusicBuffer->PackStructured(rt, group, msg);
+    if (FAILED(hr))
+    {
+        // Buffer likely full — drain and retry once.
+        m_pPort->PlayBuffer(m_pMusicBuffer);
+        m_pMusicBuffer->Flush();
+        hr = m_pMusicBuffer->PackStructured(rt, group, msg);
+        m_tsStats.retryCount++;
+    }
+    return hr;
+}
+
+HRESULT DmSynth::PackUnstructuredWithRetry(REFERENCE_TIME rt, uint32_t group, uint32_t length, const uint8_t* data)
+{
+    HRESULT hr = m_pMusicBuffer->PackUnstructured(rt, group, length, (LPBYTE)data);
+    if (FAILED(hr))
+    {
+        m_pPort->PlayBuffer(m_pMusicBuffer);
+        m_pMusicBuffer->Flush();
+        hr = m_pMusicBuffer->PackUnstructured(rt, group, length, (LPBYTE)data);
+        m_tsStats.retryCount++;
+    }
+    return hr;
+}
+
+void DmSynth::AccumulateTimestampStats(REFERENCE_TIME scheduledRt, bool isSysEx)
+{
+    if (!m_pLatencyClock)
+        return;
+
+    REFERENCE_TIME now = 0;
+    if (FAILED(m_pLatencyClock->GetTime(&now)))
+        return;
+
+    // Lead = scheduled time − current latency-clock time. Negative = late
+    // (DirectMusic treats as "play now"). Callback delay is the inverse
+    // side of the same coin: cbDelay = schedulingLead − lead, i.e. how long
+    // after MIDI arrival the message was actually packed. It's the main
+    // thing to look at when deciding whether schedulingLead is big enough.
+    REFERENCE_TIME lead = scheduledRt - now;
+    REFERENCE_TIME cbDelay = m_schedulingLead - lead;
+
+    if (!m_tsStats.haveSample)
+    {
+        m_tsStats.windowStart = now;
+        m_tsStats.leadMin = lead;
+        m_tsStats.leadMax = lead;
+        m_tsStats.cbDelayMin = cbDelay;
+        m_tsStats.cbDelayMax = cbDelay;
+        m_tsStats.haveSample = true;
+    }
+    else
+    {
+        m_tsStats.leadMin = (std::min)(m_tsStats.leadMin, lead);
+        m_tsStats.leadMax = (std::max)(m_tsStats.leadMax, lead);
+        m_tsStats.cbDelayMin = (std::min)(m_tsStats.cbDelayMin, cbDelay);
+        m_tsStats.cbDelayMax = (std::max)(m_tsStats.cbDelayMax, cbDelay);
+    }
+    m_tsStats.leadSum += lead;
+    m_tsStats.cbDelaySum += cbDelay;
+    if (isSysEx)
+        m_tsStats.sysexCount++;
+    else
+        m_tsStats.midiCount++;
+    if (lead < 0)
+        m_tsStats.lateCount++;
+
+    // Flush once per ~1 s (10,000,000 × 100ns).
+    if (now - m_tsStats.windowStart >= 10000000LL)
+    {
+        uint32_t total = m_tsStats.midiCount + m_tsStats.sysexCount;
+
+        // Carry over if sample size is too small to trust cbDelayMax. Advance
+        // the eval anchor by ~1 s but keep accumulated stats so the next check
+        // sees a longer observation window with more samples.
+        if (total < kAutoTuneMinSamples)
+        {
+            m_tsStats.windowStart += 10000000LL;
+            return;
+        }
+
+        double avgLead = static_cast<double>(m_tsStats.leadSum) / total / 10000.0;
+        double avgCb = static_cast<double>(m_tsStats.cbDelaySum) / total / 10000.0;
+        double cbMaxMs = static_cast<double>(m_tsStats.cbDelayMax) / 10000.0;
+
+        // ---- Auto-tune ----
+        // Tracks the steady-state callback-delay distribution; NOT a hitch
+        // defense (tiny lead bumps can't absorb 10-100 ms stalls). Uses a
+        // signed hysteresis accumulator: a window's signal (+1 want-up, -1
+        // want-down, 0 in-band) is summed; opposing signals reset to ±1, 0s
+        // don't reset. Action fires when |pending| reaches kAutoTuneHystVotes.
+        double leadMsPrecise = static_cast<double>(m_schedulingLead) / 10000.0;
+        double headroom = leadMsPrecise - cbMaxMs;
+        bool hadLate = (m_tsStats.lateCount > 0);
+        int signal = 0;
+        if (hadLate || headroom < kAutoTuneTargetLowMs)
+            signal = +1;
+        else if (headroom > kAutoTuneTargetHighMs)
+            signal = -1;
+
+        int adjust = 0;
+        if (m_autoTuneFrozen)
+        {
+            if (signal != 0)
+            {
+                m_autoTuneFrozen = false;
+                m_autoTuneStableSeconds = 0;
+                m_autoTunePending = signal; // seed count at 1 in that direction
+            }
+        }
+        else
+        {
+            if (signal > 0)
+                m_autoTunePending = (m_autoTunePending < 0) ? 1 : m_autoTunePending + 1;
+            else if (signal < 0)
+                m_autoTunePending = (m_autoTunePending > 0) ? -1 : m_autoTunePending - 1;
+            // signal == 0: leave m_autoTunePending unchanged (= doesn't reset)
+
+            if (m_autoTunePending >= kAutoTuneHystVotes)
+            {
+                adjust = +1;
+                m_autoTunePending = 0;
+                m_autoTuneStableSeconds = 0;
+            }
+            else if (m_autoTunePending <= -kAutoTuneHystVotes)
+            {
+                adjust = -1;
+                m_autoTunePending = 0;
+                m_autoTuneStableSeconds = 0;
+            }
+            else if (signal == 0)
+            {
+                // Calm in-band window: progress toward freeze even if a stale
+                // unresolved vote is pending — otherwise a single lingering
+                // spike could block freeze indefinitely.
+                m_autoTuneStableSeconds++;
+                if (m_autoTuneStableSeconds >= kAutoTuneFreezeSeconds)
+                {
+                    m_autoTuneFrozen = true;
+                    m_autoTunePending = 0;
+                }
+            }
+        }
+
+        if (adjust > 0)
+        {
+            uint32_t shift = (std::min)(m_autoTuneConsecUp, kAutoTuneUpShiftMax);
+            m_schedulingLead += kAutoTuneStepRt << shift;
+            m_autoTuneConsecUp++;
+        }
+        else if (adjust < 0)
+        {
+            m_autoTuneConsecUp = 0;
+            if (m_schedulingLead - kAutoTuneStepRt >= kAutoTuneMinLeadRt)
+                m_schedulingLead -= kAutoTuneStepRt;
+        }
+
+#if DMSYNTH_DEBUG_TIMESTAMPS
+        {
+            std::lock_guard<std::mutex> slock(m_outLinesMutex);
+            swprintf_s(m_statsLineBuf, _countof(m_statsLineBuf),
+                       L"[TS 1s] msgs=%u sysex=%u late=%u retries=%u lead=%.2fms%s pend=%+d "
+                       L"cbDelay(min/avg/max)=%.2f/%.2f/%.2f ms  "
+                       L"actualLead(min/avg/max)=%.2f/%.2f/%.2f ms",
+                       m_tsStats.midiCount, m_tsStats.sysexCount, m_tsStats.lateCount, m_tsStats.retryCount,
+                       static_cast<double>(m_schedulingLead) / 10000.0,
+                       m_autoTuneFrozen ? L"(F)" : (adjust > 0 ? L"(+)" : (adjust < 0 ? L"(-)" : L"(=)")),
+                       m_autoTunePending, static_cast<double>(m_tsStats.cbDelayMin) / 10000.0, avgCb,
+                       static_cast<double>(m_tsStats.cbDelayMax) / 10000.0,
+                       static_cast<double>(m_tsStats.leadMin) / 10000.0, avgLead,
+                       static_cast<double>(m_tsStats.leadMax) / 10000.0);
+            m_statsLineReady = true;
+        }
+#endif
+        m_tsStats = TimestampStats{};
+    }
 }
 
 bool DmSynth::DownloadGMInstruments()
@@ -396,7 +654,8 @@ bool DmSynth::DownloadGMInstruments()
     return true;
 }
 
-bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint32_t channelGroup)
+bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint32_t channelGroup,
+                              REFERENCE_TIME timestamp)
 {
     if (!m_pPort || !m_pMusicBuffer)
         return false;
@@ -419,6 +678,14 @@ bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint
         else if (data1 == 0x20)
         { // Bank Select LSB
             m_bankLSB[idx] = data2;
+        }
+        else if (data1 == 0x79)
+        { // Reset All Controllers: clear bank tracking for this channel
+            // MIDI spec does not require bank select to reset on CC 0x79,
+            // but we reset it to prevent stale bank state from affecting
+            // subsequent program change fallback logic.
+            m_bankMSB[idx] = 0;
+            m_bankLSB[idx] = 0;
         }
     }
     else if (msgType == 0xC0)
@@ -488,17 +755,17 @@ bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint
             uint32_t fLSB = (finalPatch >> 8) & 0xFF;
             uint32_t fProg = finalPatch & 0xFF;
 
-            fwprintf(stdout,
-                     L"[Translate] Program Change ch%u: Bank %u/%u Prog %u → Bank %u/%u Prog %u (fallback L%d)\n",
-                     channel + 1, bankMSB, bankLSB, program, fMSB, fLSB, fProg, fallbackLevel);
+            EnqueueTranslateLine(
+                L"[Translate] Program Change ch%u: Bank %u/%u Prog %u → Bank %u/%u Prog %u (fallback L%d)", channel + 1,
+                bankMSB, bankLSB, program, fMSB, fLSB, fProg, fallbackLevel);
 
             // Re-route to fallback:
             // 1. Send Bank Select
-            m_pMusicBuffer->PackStructured(0, channelGroup, (0xB0 | channel) | (0x00 << 8) | (fMSB << 16));
-            m_pMusicBuffer->PackStructured(0, channelGroup, (0xB0 | channel) | (0x20 << 8) | (fLSB << 16));
+            PackStructuredWithRetry(timestamp, channelGroup, (0xB0 | channel) | (0x00 << 8) | (fMSB << 16));
+            PackStructuredWithRetry(timestamp, channelGroup, (0xB0 | channel) | (0x20 << 8) | (fLSB << 16));
 
             // 2. Send Program Change
-            m_pMusicBuffer->PackStructured(0, channelGroup, (0xC0 | channel) | (fProg << 8));
+            PackStructuredWithRetry(timestamp, channelGroup, (0xC0 | channel) | (fProg << 8));
 
             m_pPort->PlayBuffer(m_pMusicBuffer);
             m_pMusicBuffer->Flush();
@@ -526,7 +793,9 @@ bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint
 
     DWORD midiMessage = status | (data1 << 8) | (data2 << 16);
 
-    HRESULT hr = m_pMusicBuffer->PackStructured(0, channelGroup, midiMessage);
+    AccumulateTimestampStats(timestamp, false);
+
+    HRESULT hr = PackStructuredWithRetry(timestamp, channelGroup, midiMessage);
     if (FAILED(hr))
         return false;
 
@@ -538,7 +807,7 @@ bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint
     return true;
 }
 
-bool DmSynth::SendSysEx(const uint8_t* data, uint32_t length, uint32_t channelGroup)
+bool DmSynth::SendSysEx(const uint8_t* data, uint32_t length, uint32_t channelGroup, REFERENCE_TIME timestamp)
 {
     if (!m_pPort || !m_pMusicBuffer)
         return false;
@@ -562,22 +831,17 @@ bool DmSynth::SendSysEx(const uint8_t* data, uint32_t length, uint32_t channelGr
     {
         // Proxy GM System On/Off and XG System On to GS Reset, which the MS GS Wavetable Synth handles natively.
         if (isGmOn)
-            fwprintf(stdout, L"[Translate] GM System On → GS Reset\n");
+            EnqueueTranslateLine(L"[Translate] GM System On → GS Reset");
         else if (isGmOff)
-            fwprintf(stdout, L"[Translate] GM System Off → GS Reset\n");
+            EnqueueTranslateLine(L"[Translate] GM System Off → GS Reset");
         else if (isXgOn)
-            fwprintf(stdout, L"[Translate] XG System On → GS Reset\n");
+            EnqueueTranslateLine(L"[Translate] XG System On → GS Reset");
         static const uint8_t gsResetMsg[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7};
-        m_pMusicBuffer->PackUnstructured(0, channelGroup, sizeof(gsResetMsg), (LPBYTE)gsResetMsg);
+        PackUnstructuredWithRetry(timestamp, channelGroup, sizeof(gsResetMsg), gsResetMsg);
         m_pPort->PlayBuffer(m_pMusicBuffer);
         m_pMusicBuffer->Flush();
 
-        memset(m_bankMSB, 0, sizeof(m_bankMSB));
-        memset(m_bankLSB, 0, sizeof(m_bankLSB));
-        memset(m_drumChannel, 0, sizeof(m_drumChannel));
-        m_drumChannel[9] = true;  // Group 1 (A), CH10
-        m_drumChannel[25] = true; // Group 2 (B), CH10
-        SendDefaultEffects();
+        ResetInternalState();
         return true;
     }
 
@@ -621,7 +885,7 @@ bool DmSynth::SendSysEx(const uint8_t* data, uint32_t length, uint32_t channelGr
             uint8_t xgMsb = data[7];
             uint8_t xgLsb = (length >= 10) ? data[8] : 0;
             uint8_t gsMacro = MapXgReverbToGs(xgMsb, xgLsb);
-            fwprintf(stdout, L"[Translate] XG Reverb %02X/%02X → GS Reverb macro %02X\n", xgMsb, xgLsb, gsMacro);
+            EnqueueTranslateLine(L"[Translate] XG Reverb %02X/%02X → GS Reverb macro %02X", xgMsb, xgLsb, gsMacro);
             SendGsReverbMacro(gsMacro);
             return true;
         }
@@ -630,13 +894,15 @@ bool DmSynth::SendSysEx(const uint8_t* data, uint32_t length, uint32_t channelGr
             uint8_t xgMsb = data[7];
             uint8_t xgLsb = (length >= 10) ? data[8] : 0;
             uint8_t gsMacro = MapXgChorusToGs(xgMsb, xgLsb);
-            fwprintf(stdout, L"[Translate] XG Chorus %02X/%02X → GS Chorus macro %02X\n", xgMsb, xgLsb, gsMacro);
+            EnqueueTranslateLine(L"[Translate] XG Chorus %02X/%02X → GS Chorus macro %02X", xgMsb, xgLsb, gsMacro);
             SendGsChorusMacro(gsMacro);
             return true;
         }
     }
 
-    HRESULT hr = m_pMusicBuffer->PackUnstructured(0, channelGroup, length, (LPBYTE)data);
+    AccumulateTimestampStats(timestamp, true);
+
+    HRESULT hr = PackUnstructuredWithRetry(timestamp, channelGroup, length, data);
     if (FAILED(hr))
         return false;
 
@@ -648,58 +914,47 @@ bool DmSynth::SendSysEx(const uint8_t* data, uint32_t length, uint32_t channelGr
     return true;
 }
 
+void DmSynth::AllSoundOffLocked()
+{
+    if (!m_pPort || !m_pMusicBuffer)
+        return;
+
+    uint32_t groups = m_activeConfig.channelGroups > 0 ? m_activeConfig.channelGroups : 1;
+    for (uint32_t group = 1; group <= groups; group++)
+    {
+        for (uint8_t ch = 0; ch < 16; ch++)
+            PackStructuredWithRetry(0, group, (0xB0 | ch) | (120 << 8) | (0 << 16));
+        m_pPort->PlayBuffer(m_pMusicBuffer);
+        m_pMusicBuffer->Flush();
+    }
+}
+
+void DmSynth::AllSoundOff()
+{
+    if (!m_pPort || !m_pMusicBuffer)
+        return;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    AllSoundOffLocked();
+}
+
 void DmSynth::ResetAllState()
 {
     if (!m_pPort || !m_pMusicBuffer)
         return;
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    for (uint32_t group = 1; group <= 2; group++)
-    {
-        for (uint8_t ch = 0; ch < 16; ch++)
-        {
-            // All Sound Off (CC 120) - immediately silence all voices
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (120 << 8) | (0 << 16));
-            // Reset All Controllers (CC 121)
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (121 << 8) | (0 << 16));
-            // All Notes Off (CC 123)
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (123 << 8) | (0 << 16));
-            // Bank Select MSB reset (CC 0)
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (0 << 8) | (0 << 16));
-            // Bank Select LSB reset (CC 32)
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (32 << 8) | (0 << 16));
-            // Program Change to 0
-            m_pMusicBuffer->PackStructured(0, group, (0xC0 | ch) | (0 << 8));
-            // Pitch Bend center
-            m_pMusicBuffer->PackStructured(0, group, (0xE0 | ch) | (0 << 8) | (64 << 16));
-            // GM default CC values
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (7 << 8) | (100 << 16));  // Volume = 100
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (10 << 8) | (64 << 16));  // Pan = 64 (center)
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (11 << 8) | (127 << 16)); // Expression = 127
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (91 << 8) | (40 << 16));  // Reverb Send = 40
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (93 << 8) | (0 << 16));   // Chorus Send = 0
-            m_pPort->PlayBuffer(m_pMusicBuffer);
-            m_pMusicBuffer->Flush();
-            // Pitch Bend Sensitivity = ±2 semitones (RPN 0,0)
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (101 << 8) | (0 << 16));   // RPN MSB = 0
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (100 << 8) | (0 << 16));   // RPN LSB = 0
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (6 << 8) | (2 << 16));     // Data Entry = 2
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (38 << 8) | (0 << 16));    // Data Entry LSB = 0
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (101 << 8) | (127 << 16)); // RPN Null
-            m_pMusicBuffer->PackStructured(0, group, (0xB0 | ch) | (100 << 8) | (127 << 16)); // RPN Null
-            m_pPort->PlayBuffer(m_pMusicBuffer);
-            m_pMusicBuffer->Flush();
-        }
-    }
+    // 1. All Sound Off on every channel to silence voices immediately
+    AllSoundOffLocked();
 
-    // Reset internal tracking state
-    memset(m_bankMSB, 0, sizeof(m_bankMSB));
-    memset(m_bankLSB, 0, sizeof(m_bankLSB));
-    memset(m_drumChannel, 0, sizeof(m_drumChannel));
-    m_drumChannel[9] = true;  // Group 1, CH10
-    m_drumChannel[25] = true; // Group 2, CH10
+    // 2. GS Reset (F0 41 10 42 12 40 00 7F 00 41 F7)
+    //    Resets all GS parameters: tuning, pitch bend, controllers, programs, effects, etc.
+    static const uint8_t gsResetMsg[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7};
+    PackUnstructuredWithRetry(0, 1, sizeof(gsResetMsg), gsResetMsg);
+    m_pPort->PlayBuffer(m_pMusicBuffer);
+    m_pMusicBuffer->Flush();
 
-    SendDefaultEffects();
+    // 3. Reset internal tracking state + re-apply custom defaults
+    ResetInternalState();
 }
 
 // Send GS Reverb Macro SysEx: F0 41 10 42 12 40 01 30 <type> <checksum> F7
@@ -709,7 +964,7 @@ void DmSynth::SendGsReverbMacro(uint8_t type)
     uint8_t sum = 0x40 + 0x01 + 0x30 + type;
     uint8_t checksum = (128 - (sum & 0x7F)) & 0x7F;
     uint8_t sysex[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x01, 0x30, type, checksum, 0xF7};
-    m_pMusicBuffer->PackUnstructured(0, 1, sizeof(sysex), sysex);
+    PackUnstructuredWithRetry(0, 1, sizeof(sysex), sysex);
     m_pPort->PlayBuffer(m_pMusicBuffer);
     m_pMusicBuffer->Flush();
 }
@@ -721,7 +976,7 @@ void DmSynth::SendGsChorusMacro(uint8_t type)
     uint8_t sum = 0x40 + 0x01 + 0x38 + type;
     uint8_t checksum = (128 - (sum & 0x7F)) & 0x7F;
     uint8_t sysex[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x01, 0x38, type, checksum, 0xF7};
-    m_pMusicBuffer->PackUnstructured(0, 1, sizeof(sysex), sysex);
+    PackUnstructuredWithRetry(0, 1, sizeof(sysex), sysex);
     m_pPort->PlayBuffer(m_pMusicBuffer);
     m_pMusicBuffer->Flush();
 }
@@ -736,9 +991,20 @@ void DmSynth::SendGsDelayMacro(uint8_t type)
     uint8_t sum = 0x40 + 0x01 + 0x50 + type;
     uint8_t checksum = (128 - (sum & 0x7F)) & 0x7F;
     uint8_t sysex[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x01, 0x50, type, checksum, 0xF7};
-    m_pMusicBuffer->PackUnstructured(0, 1, sizeof(sysex), sysex);
+    PackUnstructuredWithRetry(0, 1, sizeof(sysex), sysex);
     m_pPort->PlayBuffer(m_pMusicBuffer);
     m_pMusicBuffer->Flush();
+}
+
+// Reset internal tracking state and re-apply custom defaults. Caller must hold m_mutex.
+void DmSynth::ResetInternalState()
+{
+    memset(m_bankMSB, 0, sizeof(m_bankMSB));
+    memset(m_bankLSB, 0, sizeof(m_bankLSB));
+    memset(m_drumChannel, 0, sizeof(m_drumChannel));
+    m_drumChannel[9] = true;  // Group 1, CH10
+    m_drumChannel[25] = true; // Group 2, CH10
+    SendDefaultEffects();
 }
 
 // Set default GS effect types. Caller must hold m_mutex.
@@ -746,7 +1012,7 @@ void DmSynth::SendDefaultEffects()
 {
     // GM Master Volume = 100 (Universal Real Time SysEx: F0 7F 7F 04 01 <LSB> <MSB> F7)
     static const uint8_t masterVolMsg[] = {0xF0, 0x7F, 0x7F, 0x04, 0x01, 0x00, 0x64, 0xF7};
-    m_pMusicBuffer->PackUnstructured(0, 1, sizeof(masterVolMsg), (LPBYTE)masterVolMsg);
+    PackUnstructuredWithRetry(0, 1, sizeof(masterVolMsg), masterVolMsg);
     m_pPort->PlayBuffer(m_pMusicBuffer);
     m_pMusicBuffer->Flush();
 
@@ -755,10 +1021,59 @@ void DmSynth::SendDefaultEffects()
     SendGsDelayMacro(0x00);  // Delay1 (GS default)
 }
 
+bool DmSynth::TryDrainStatsLine(wchar_t* out, size_t cap)
+{
+    if (!out || cap == 0)
+        return false;
+    std::lock_guard<std::mutex> slock(m_outLinesMutex);
+    if (!m_statsLineReady)
+        return false;
+    wcsncpy_s(out, cap, m_statsLineBuf, _TRUNCATE);
+    m_statsLineReady = false;
+    return true;
+}
+
+bool DmSynth::TryDrainTranslateLine(wchar_t* out, size_t cap)
+{
+    if (!out || cap == 0)
+        return false;
+    std::lock_guard<std::mutex> slock(m_outLinesMutex);
+    if (m_pendingTranslateLines.empty())
+        return false;
+    wcsncpy_s(out, cap, m_pendingTranslateLines.front().c_str(), _TRUNCATE);
+    m_pendingTranslateLines.pop_front();
+    return true;
+}
+
+void DmSynth::EnqueueTranslateLine(const wchar_t* fmt, ...)
+{
+    wchar_t buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vswprintf_s(buf, _countof(buf), fmt, ap);
+    va_end(ap);
+
+    std::lock_guard<std::mutex> slock(m_outLinesMutex);
+    if (m_pendingTranslateLines.size() >= kMaxPendingTranslateLines)
+        m_pendingTranslateLines.pop_front(); // drop oldest on overflow
+    m_pendingTranslateLines.emplace_back(buf);
+}
+
 void DmSynth::Shutdown()
 {
     if (!m_initialized)
         return;
+
+    // Silence any voices still sounding before tearing the port down.
+    if (m_pPort && m_pMusicBuffer)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        AllSoundOffLocked();
+    }
+
+    // Give the synth time to render the All Sound Off so trailing audio
+    // doesn't bleed into the next session.
+    Sleep(500);
 
     if (m_pPort)
     {
@@ -790,6 +1105,13 @@ void DmSynth::Shutdown()
         m_pMusicBuffer->Release();
         m_pMusicBuffer = nullptr;
     }
+
+    if (m_pLatencyClock)
+    {
+        m_pLatencyClock->Release();
+        m_pLatencyClock = nullptr;
+    }
+    m_anchorInitialized = false;
 
     if (m_pPort)
     {
