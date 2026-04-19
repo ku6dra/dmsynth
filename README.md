@@ -17,10 +17,27 @@ A lightweight MIDI synthesizer proxy for Windows 10/11 that drives the native **
   | XG System On (`F0 43 10 4C ...`) | GS Reset |
   | XG Reverb / Chorus type changes | Similar GS Reverb / Chorus macro |
 
-- **Surrogate voice** — If a requested bank/patch is missing from the DLS, the nearest available instrument is substituted: exact bank/patch → bank 0 + same patch → any bank + same patch → any bank + patch 0 → first available instrument.
+- **Capital Tone Fallback** — When a requested bank/patch is missing from the DLS, the closest available instrument is substituted by walking up the GS tone-map hierarchy (sub-capital → capital → any bank → first available). Drum kits fall back along the program number instead of the bank MSB.
 - **Drum Note Off workaround** — Tracks GS "Use for Rhythm Part" SysEx; ignores Note Off on drum channels to prevent voices from being cut off prematurely if a Note Off message follows a Note On too closely.
 - **32-channel MIDI** — Two MIDI inputs map to Channel Group 1 (CH 1 - 16) and Group 2 (CH 17 - 32).
-- **Low-latency audio** — DirectSound output with MMCSS thread boosting on MIDI input. ~120 ms lower latency than Microsoft GS Wavetable Synth. (~30 ms higher latency than VirtualMIDISynth)
+- **Scheduled playback** — Outgoing MIDI is timestamped against DirectMusic's latency clock to absorb callback jitter.
+- **Low-latency audio** — DirectSound output with MMCSS thread boosting on MIDI input.
+
+### Comparison
+
+| Feature | MSGS | **DMSynth** | VirtualMIDISynth |
+| :--- | :--- | :--- | :--- |
+| **Core Engine** | DirectMusic | **DirectMusic (Native COM)** | BASSMIDI |
+| **Sound Format** | DLS (`gm.dls` only) | **DLS** | SF2 / SFZ |
+| **Sample Rate** | 22,050 Hz | **44,100 Hz** (*) | 48,000 Hz (*) |
+| **Voices** | 32 | **128** (1–1000 *) | 16–100,000 (*) |
+| **Latency** | 150 ms | **Dynamic: Avg. 46 ms** (Min. 30 ms) | 0 ms (*) |
+| **Capital Tone Fallback** | No | **Yes** | Yes |
+| **Channels** | 16 | **32** (2 groups, shared engine) | 64 (4 independent groups) |
+
+\* *Configurable*
+
+
 
 ## Requirements
 
@@ -66,6 +83,7 @@ On the latest versions of Windows 11, [MIDI 2.0](https://github.com/microsoft/mi
 | `--voices <n>` | Maximum polyphony (default: 128) |
 | `--dls <path>` | Path to a DLS file (default: system `gm.dls`) |
 | `--verbose, -v` | Enable MIDI event logging on startup |
+| `--immediate` | Bypass timestamp scheduling and send events for immediate playback. Use when running alongside software like DirectMusic Producer, which can throttle DirectSound and cause scheduled playback to run slow |
 | `--list` | List available devices/ports and exit |
 | `--help, -h` | Show help and exit |
 
@@ -106,15 +124,17 @@ graph TD
     subgraph Logic ["Processing (DmSynth)"]
         MI --> DS["Message Dispatcher"]
         DS -->|SysEx| GS["GS/XG Translation"]
-        DS -->|Program Change| FB["Patch Fallback"]
+        DS -->|Program Change| FB["Capital Tone Fallback"]
         DS -->|Note Off, Drum Ch| NF["Note Off Filter<br/>(dropped)"]
-        DS -->|Other| Buf["IDirectMusicBuffer"]
-        GS --> Buf
-        FB --> Buf
+        DS -->|Other| TS
+        GS --> TS
+        FB --> TS
+        TS["Timestamping<br/>(scheduled / immediate)"] --> Buf["IDirectMusicBuffer"]
     end
 
     subgraph Output ["Synthesis (DirectMusic)"]
         Buf --> Synth["Microsoft Synthesizer<br/>(IDirectMusicPort)"]
+        LC["Latency Clock"] -.->|reference time| TS
         Synth --> DirectSound["DirectSound"]
         DirectSound --> AudioOutput((Audio))
     end
@@ -125,7 +145,7 @@ graph TD
 ```
 
 - **MidiInput** — WinMM wrapper with MMCSS priority boost and lock-free SysEx buffering.
-- **DmSynth** — Processes MIDI messages including GS/XG translation, instrument fallback, and Note Off filtering; dispatches to DirectMusic buffers.
+- **DmSynth** — Processes MIDI messages including GS/XG translation, Capital Tone Fallback, and Note Off filtering. In scheduled mode each event is timestamped against the port's latency clock (auto-tuned at runtime) to absorb callback jitter; `--immediate` bypasses timestamping and sends events for immediate playback.
 - **Main loop** — Manages log event draining via an SPSC ring buffer to ensure the high-priority MIDI thread remains non-blocking for real-time performance.
 
 ## License

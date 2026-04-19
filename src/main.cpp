@@ -230,6 +230,7 @@ int wmain(int argc, wchar_t* argv[])
     config.channelGroups = 2;
     config.audioChannels = 2;
     config.dlsPath = args.dlsPath;
+    config.forceImmediateMode = args.immediate;
 
     if (!synth.CreateSynthPort(ports[portChoice].guid, config))
     {

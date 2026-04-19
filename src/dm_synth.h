@@ -31,9 +31,10 @@ struct SynthConfig
 {
     uint32_t sampleRate = 44100; // DEFAULT: 44.1kHz Stereo for Native DirectMusic
     uint32_t voices = 128;
-    uint32_t channelGroups = 2; // 2 channel groups = 32 MIDI channels
-    uint32_t audioChannels = 2; // Stereo
-    std::wstring dlsPath;       // DLS file path (empty = system gm.dls)
+    uint32_t channelGroups = 2;   // 2 channel groups = 32 MIDI channels
+    uint32_t audioChannels = 2;   // Stereo
+    std::wstring dlsPath;         // DLS file path (empty = system gm.dls)
+    bool forceImmediateMode = false; // CLI --immediate: use rt=0 scheduling
 };
 
 class DmSynth
@@ -140,6 +141,14 @@ class DmSynth
     REFERENCE_TIME m_refAnchor = 0;
     DWORD m_winmmAnchorMs = 0;
     bool m_anchorInitialized = false;
+
+    // When true, MidiMsToRefTime returns 0 (immediate playback) and the
+    // timestamp/auto-tune stats are bypassed. Set via CLI
+    // (forceImmediateMode) to coexist with software like DirectMusic
+    // Producer, which can throttle our DirectSound secondary-buffer
+    // consumption and drag the latency clock off wall-clock rate —
+    // scheduled-mode playback then runs slow (observed ~25%).
+    bool m_immediateMode = false;
     // Added to each outgoing timestamp. Signed so the controller can go
     // below 0 when anchor ε is large (schedule in the past → DirectMusic
     // renders "as soon as possible"). Auto-tuned at runtime; start value

@@ -19,6 +19,7 @@ struct CliArgs
     int voices = -1;      // -1 = use default (128)
     std::wstring dlsPath; // empty = system gm.dls
     bool verbose = false;
+    bool immediate = false; // force rt=0 scheduling (for coexistence with software like DirectMusic Producer)
     bool listDevices = false;
     bool showHelp = false;
     bool parseError = false;

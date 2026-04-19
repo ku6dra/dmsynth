@@ -317,6 +317,21 @@ bool DmSynth::CreateSynthPort(const GUID& portGuid, const SynthConfig& config)
         m_pLatencyClock = nullptr;
     }
 
+    // Timing mode: scheduled by default (uses the port's latency clock to
+    // absorb callback jitter). Passing --immediate forces rt=0 on every
+    // outgoing message, which is required when running alongside software
+    // like DirectMusic Producer — such software can throttle our
+    // DirectSound buffer in a way that drags the latency clock off
+    // wall-clock rate, making scheduled playback run slow. We do not
+    // auto-detect this: the ratio observed in practice is noisy enough
+    // that a reliable threshold is hard to pick.
+    m_immediateMode = config.forceImmediateMode || !m_pLatencyClock;
+    if (m_immediateMode)
+    {
+        fwprintf(stdout, L"Timing mode: immediate (%s)\n",
+                 config.forceImmediateMode ? L"forced by --immediate" : L"no latency clock available");
+    }
+
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         SendDefaultEffects();
@@ -326,7 +341,7 @@ bool DmSynth::CreateSynthPort(const GUID& portGuid, const SynthConfig& config)
 
 REFERENCE_TIME DmSynth::MidiMsToRefTime(DWORD absWinmmMs)
 {
-    if (!m_pLatencyClock)
+    if (!m_pLatencyClock || m_immediateMode)
         return 0;
 
     // Serialize anchor state against concurrent MIDI-in threads (e.g. port 2).
@@ -415,7 +430,7 @@ HRESULT DmSynth::PackUnstructuredWithRetry(REFERENCE_TIME rt, uint32_t group, ui
 
 void DmSynth::AccumulateTimestampStats(REFERENCE_TIME scheduledRt, bool isSysEx)
 {
-    if (!m_pLatencyClock)
+    if (!m_pLatencyClock || m_immediateMode)
         return;
 
     REFERENCE_TIME now = 0;
@@ -696,7 +711,30 @@ bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint
         uint32_t drumFlag = isDrum ? 0x80000000 : 0;
 
         uint32_t requestedPatch = drumFlag | (bankMSB << 16) | (bankLSB << 8) | program;
-        uint32_t bank0Patch = drumFlag | program;
+        // GS tone-map fallback. LSB selects the sound-module map
+        // (SC-55 / SC-88Pro / SC-8850 / ...) rather than the tone itself, so
+        // it is dropped during lookup.
+        //
+        // For melodic channels the capitals/sub-capitals sit at MSB 0, 8,
+        // 16, ... with program selecting the tone within the group, so MSB
+        // rounds down to the nearest multiple of 8 (sub-capital) then to 0
+        // (capital). For drum channels the kit is selected by program, and
+        // SC-55's kits group the same way at PC 0 (STANDARD) / 8 (ROOM) /
+        // 16 (POWER) / 24 (ELECTRONIC) / 32 (JAZZ) / 40 (BRUSH) / 48
+        // (ORCHESTRA) / 56 (SFX) — so drums round PC instead of MSB.
+        uint32_t subCapitalPatch, capitalPatch;
+        if (isDrum)
+        {
+            uint32_t subCapitalPC = (program / 8) * 8;
+            subCapitalPatch = drumFlag | subCapitalPC;
+            capitalPatch = drumFlag; // PC 0 = STANDARD kit
+        }
+        else
+        {
+            uint32_t subCapitalMSB = (bankMSB / 8) * 8;
+            subCapitalPatch = drumFlag | (subCapitalMSB << 16) | program;
+            capitalPatch = drumFlag | program;
+        }
 
         uint32_t finalPatch = 0;
         int fallbackLevel = 0;
@@ -716,35 +754,41 @@ bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint
             finalPatch = requestedPatch;
             fallbackLevel = 0;
         }
-        else if (exists(bank0Patch))
+        else if (subCapitalPatch != requestedPatch && exists(subCapitalPatch))
         {
-            // L1: Bank 0/0, same program
-            finalPatch = bank0Patch;
+            // L1: GS sub-capital (MSB rounded down to multiple of 8, LSB ignored)
+            finalPatch = subCapitalPatch;
             fallbackLevel = 1;
+        }
+        else if (capitalPatch != requestedPatch && capitalPatch != subCapitalPatch && exists(capitalPatch))
+        {
+            // L2: GS capital (MSB 0, LSB ignored)
+            finalPatch = capitalPatch;
+            fallbackLevel = 2;
         }
         else
         {
             uint32_t anyBankPatch = findAnyBank(program);
             if (anyBankPatch != 0xFFFFFFFF)
             {
-                // L2: any bank, same program
+                // L3: any bank, same program
                 finalPatch = anyBankPatch;
-                fallbackLevel = 2;
+                fallbackLevel = 3;
             }
             else
             {
                 uint32_t anyDefaultPatch = findAnyBank(0);
                 if (anyDefaultPatch != 0xFFFFFFFF)
                 {
-                    // L3: any bank, program 0
+                    // L4: any bank, program 0
                     finalPatch = anyDefaultPatch;
-                    fallbackLevel = 3;
+                    fallbackLevel = 4;
                 }
                 else if (!m_availablePatches.empty())
                 {
-                    // L4: absolute fallback, first available instrument
+                    // L5: absolute fallback, first available instrument
                     finalPatch = *m_availablePatches.begin();
-                    fallbackLevel = 4;
+                    fallbackLevel = 5;
                 }
             }
         }

@@ -66,6 +66,10 @@ CliArgs ParseCommandLine(int argc, wchar_t* argv[])
         {
             args.verbose = true;
         }
+        else if (arg == L"--immediate")
+        {
+            args.immediate = true;
+        }
         else if (arg == L"--midi1")
         {
             args.midi1.specified = true;
@@ -159,6 +163,8 @@ void PrintUsage(const wchar_t* programName)
     wprintf(L"  --voices <n>       Maximum number of voices\n");
     wprintf(L"  --dls <path>       DLS file path (default: system gm.dls)\n");
     wprintf(L"  --verbose, -v      Enable MIDI logging from startup\n");
+    wprintf(L"  --immediate        Force rt=0 scheduling (no latency-clock probe)\n");
+    wprintf(L"                     Use when running alongside software like DirectMusic Producer\n");
     wprintf(L"  --list             List devices/ports and exit\n");
     wprintf(L"  --help, -h         Show this help and exit\n");
     wprintf(L"\n");
