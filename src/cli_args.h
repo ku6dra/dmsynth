@@ -20,6 +20,16 @@ struct CliArgs
     std::wstring dlsPath; // empty = system gm.dls
     bool verbose = false;
     bool immediate = false; // force rt=0 scheduling (for coexistence with software like DirectMusic Producer)
+
+    // Port-level effect toggles (default on). Passed to SynthConfig; applied
+    // via DMUS_PORTPARAMS::dwEffectFlags at CreatePort.
+    bool enableReverb = true;
+    bool enableChorus = true;
+    bool enableDelay = true;
+
+    // Inter-message gap in nanoseconds. -1 = use SynthConfig default (100 ns).
+    int interMessageGapNs = -1;
+
     bool listDevices = false;
     bool showHelp = false;
     bool parseError = false;

@@ -137,6 +137,32 @@ CliArgs ParseCommandLine(int argc, wchar_t* argv[])
                 return args;
             }
         }
+        else if (arg == L"--gap-ns")
+        {
+            if (!ConsumeIntArg(argc, argv, i, L"--gap-ns", args.interMessageGapNs, args.errorMessage))
+            {
+                args.parseError = true;
+                return args;
+            }
+            if (args.interMessageGapNs < 0)
+            {
+                args.parseError = true;
+                args.errorMessage = L"--gap-ns must be >= 0";
+                return args;
+            }
+        }
+        else if (arg == L"--no-reverb")
+        {
+            args.enableReverb = false;
+        }
+        else if (arg == L"--no-chorus")
+        {
+            args.enableChorus = false;
+        }
+        else if (arg == L"--no-delay")
+        {
+            args.enableDelay = false;
+        }
         else
         {
             args.parseError = true;
@@ -159,14 +185,20 @@ void PrintUsage(const wchar_t* programName)
     wprintf(L"  --midi2 <idx|name> MIDI IN 2 device (CH17-32)\n");
     wprintf(L"                     Use -1 to disable\n");
     wprintf(L"  --port, -p <idx>   Synthesizer port index\n");
-    wprintf(L"  --rate, -r <hz>    Sample rate (Hz, e.g. 44100, 48000)\n");
-    wprintf(L"  --voices <n>       Maximum number of voices\n");
-    wprintf(L"  --dls <path>       DLS file path (default: system gm.dls)\n");
-    wprintf(L"  --verbose, -v      Enable MIDI logging from startup\n");
-    wprintf(L"  --immediate        Force rt=0 scheduling (no latency-clock probe)\n");
-    wprintf(L"                     Use when running alongside software like DirectMusic Producer\n");
-    wprintf(L"  --list             List devices/ports and exit\n");
-    wprintf(L"  --help, -h         Show this help and exit\n");
+    wprintf(L"  --rate, -r <hz>    Sample rate in Hz (default: 44100). Supported: 11025, 22050, 44100\n");
+    wprintf(L"  --voices <n>       Maximum polyphony (default: 128)\n");
+    wprintf(L"  --dls <path>       Path to a DLS file (default: system gm.dls)\n");
+    wprintf(L"  --verbose, -v      Enable MIDI event logging on startup\n");
+    wprintf(L"  --immediate        Bypass timestamp scheduling and send events for immediate playback\n");
+    wprintf(L"  --no-reverb        Disable port-level reverb effect\n");
+    wprintf(L"  --no-chorus        Disable port-level chorus effect\n");
+    wprintf(L"  --no-delay         Disable port-level delay effect\n");
+    wprintf(L"                     Effect toggles are applied at port creation via dwEffectFlags\n");
+    wprintf(L"  --gap-ns <ns>      Minimum gap between events in nanoseconds (default: 100).\n");
+    wprintf(L"                     Higher values roughly simulate MIDI cable bandwidth\n");
+    wprintf(L"                     (e.g., 960,000 ns for a Note On at 31250 bps).\n");
+    wprintf(L"  --list             List available devices/ports and exit\n");
+    wprintf(L"  --help, -h         Show help and exit\n");
     wprintf(L"\n");
     wprintf(L"Unspecified options use default values or interactive prompts.\n");
     wprintf(L"\n");

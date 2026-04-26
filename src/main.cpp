@@ -231,6 +231,14 @@ int wmain(int argc, wchar_t* argv[])
     config.audioChannels = 2;
     config.dlsPath = args.dlsPath;
     config.forceImmediateMode = args.immediate;
+    config.enableReverb = args.enableReverb;
+    config.enableChorus = args.enableChorus;
+    config.enableDelay = args.enableDelay;
+    if (args.interMessageGapNs >= 0)
+    {
+        REFERENCE_TIME rt = static_cast<REFERENCE_TIME>(args.interMessageGapNs) / 100; // ns -> 100 ns units
+        config.interMessageGapRt = (rt > 0) ? rt : 1;                                  // keep monotonic floor
+    }
 
     if (!synth.CreateSynthPort(ports[portChoice].guid, config))
     {
@@ -410,41 +418,46 @@ int wmain(int argc, wchar_t* argv[])
                 if (!g_verboseLog.load(std::memory_order_relaxed))
                     continue;
                 wrote = true;
+                wchar_t groupChar = L'A' + static_cast<wchar_t>(evt.group - 1);
                 if (evt.kind == 1)
                 {
-                    wprintf(L"  \x1b[95m[G%u] SysEx: %lu bytes\x1b[0m\n", evt.group, evt.sysExLength);
+                    wprintf(L"  \x1b[95mSysEx [%lc]  %lu bytes\x1b[0m\n", groupChar, evt.sysExLength);
                     continue;
                 }
                 uint8_t msgType = evt.status & 0xF0;
                 uint8_t channel = evt.status & 0x0F;
-                uint8_t displayCh = channel + 1 + (evt.group - 1) * 16;
                 switch (msgType)
                 {
-                case 0x90:
+                case 0x90: {
+                    wchar_t noteBuf[8];
+                    swprintf_s(noteBuf, _countof(noteBuf), L"%s%d", NoteName(evt.data1), NoteOctave(evt.data1));
                     if (evt.data2 > 0)
-                        wprintf(L"  \x1b[92m\u266a Note ON  ch=%2u  %s%d  vel=%3u\x1b[0m\n", displayCh,
-                                NoteName(evt.data1), NoteOctave(evt.data1), evt.data2);
+                        wprintf(L"  \x1b[92m\u266a ON  %lc%02u  %-4ls %3u\x1b[0m\n", groupChar, channel + 1, noteBuf,
+                                evt.data2);
                     else
-                        wprintf(L"  \x1b[90m\u266a Note OFF ch=%2u  %s%d\x1b[0m\n", displayCh, NoteName(evt.data1),
-                                NoteOctave(evt.data1));
-                    break;
-                case 0x80:
-                    wprintf(L"  \x1b[90m\u266a Note OFF ch=%2u  %s%d\x1b[0m\n", displayCh, NoteName(evt.data1),
-                            NoteOctave(evt.data1));
-                    break;
+                        wprintf(L"  \x1b[90m\u266a OFF %lc%02u  %-4ls\x1b[0m\n", groupChar, channel + 1, noteBuf);
+                }
+                break;
+                case 0x80: {
+                    wchar_t noteBuf[8];
+                    swprintf_s(noteBuf, _countof(noteBuf), L"%s%d", NoteName(evt.data1), NoteOctave(evt.data1));
+                    wprintf(L"  \x1b[90m\u266a OFF %lc%02u  %-4ls\x1b[0m\n", groupChar, channel + 1, noteBuf);
+                }
+                break;
                 case 0xB0:
-                    wprintf(L"  \x1b[33mCC ch=%2u  cc=%3u  val=%3u\x1b[0m\n", displayCh, evt.data1, evt.data2);
+                    wprintf(L"  \x1b[33m  CC  %lc%02u  %-3u  %3u\x1b[0m\n", groupChar, channel + 1, evt.data1,
+                            evt.data2);
                     break;
                 case 0xC0:
-                    wprintf(L"  \x1b[36mPC ch=%2u  prog=%3u\x1b[0m\n", displayCh, evt.data1);
+                    wprintf(L"  \x1b[36m  PC  %lc%02u       %3u\x1b[0m\n", groupChar, channel + 1, evt.data1);
                     break;
                 case 0xE0: {
                     int bend = (static_cast<int>(evt.data2) << 7) | evt.data1;
-                    wprintf(L"  \x1b[35mPB ch=%2u  bend=%5d\x1b[0m\n", displayCh, bend - 8192);
+                    wprintf(L"  \x1b[35m  PB  %lc%02u     %5d\x1b[0m\n", groupChar, channel + 1, bend - 8192);
                 }
                 break;
                 case 0xD0:
-                    wprintf(L"  \x1b[34mCP ch=%2u  pressure=%3u\x1b[0m\n", displayCh, evt.data1);
+                    wprintf(L"  \x1b[34m  CP  %lc%02u       %3u\x1b[0m\n", groupChar, channel + 1, evt.data1);
                     break;
                 }
             }

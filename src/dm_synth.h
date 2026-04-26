@@ -1,7 +1,10 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unordered_set>
 #include <mutex>
@@ -31,10 +34,25 @@ struct SynthConfig
 {
     uint32_t sampleRate = 44100; // DEFAULT: 44.1kHz Stereo for Native DirectMusic
     uint32_t voices = 128;
-    uint32_t channelGroups = 2;   // 2 channel groups = 32 MIDI channels
-    uint32_t audioChannels = 2;   // Stereo
-    std::wstring dlsPath;         // DLS file path (empty = system gm.dls)
+    uint32_t channelGroups = 2;      // 2 channel groups = 32 MIDI channels
+    uint32_t audioChannels = 2;      // Stereo
+    std::wstring dlsPath;            // DLS file path (empty = system gm.dls)
     bool forceImmediateMode = false; // CLI --immediate: use rt=0 scheduling
+
+    // Port-level effect toggles. Applied at CreatePort via dwEffectFlags.
+    // Once the port is created these cannot be changed — the effect
+    // algorithms are instantiated (or not) based on the initial flags.
+    bool enableReverb = true;
+    bool enableChorus = true;
+    bool enableDelay = true;
+
+    // Minimum gap enforced between consecutive Pack calls, in 100 ns units.
+    // Default 1 (100 ns) is just a tie-breaker so simultaneous events still
+    // arrive at the port scheduler in deterministic call order. Raise to
+    // roughly simulate a transport bandwidth limit (e.g. a real serial MIDI
+    // port at 31,250 bps takes ~320,000 ns per byte = 3,200 units; a 3-byte
+    // short message takes ~960,000 ns = 9,600 units).
+    REFERENCE_TIME interMessageGapRt = 1;
 };
 
 class DmSynth
@@ -85,18 +103,30 @@ class DmSynth
 
   private:
     bool DownloadGMInstruments();
-    void SendGsReverbMacro(uint8_t type);
-    void SendGsChorusMacro(uint8_t type);
-    void SendGsDelayMacro(uint8_t type);
+    // Send a GS Patch Part Parameter macro (F0 41 10 42 12 40 01 <addr> <type> <checksum> F7).
+    // addr: 0x30 = Reverb Macro, 0x38 = Chorus Macro, 0x50 = Delay Macro.
+    void SendGsMacro(uint8_t addr, uint8_t type, uint32_t group = 1);
     void SendDefaultEffects();
+    // Reset Pitch Bend Sensitivity to ±2 semitones on every channel of every
+    // active group. GS Reset on the Microsoft Software Synthesizer does not
+    // restore the per-channel pitch-bend range, so RPN edits from previous
+    // songs leak across resets. Caller must hold m_mutex.
+    void SendDefaultPitchBendRange();
     void ResetInternalState();
     void AllSoundOffLocked(); // caller holds m_mutex
 
     // PackStructured/PackUnstructured wrappers that flush+retry once on
     // failure (e.g. DMUS_E_BUFFER_FULL) so a transient full buffer doesn't
-    // drop MIDI data. Caller must hold m_mutex.
+    // drop MIDI data. Also enforce monotonic REFERENCE_TIME so events with
+    // identical requested rt (e.g. immediate mode rt=0) still keep arrival
+    // order at the port scheduler. Caller must hold m_mutex.
     HRESULT PackStructuredWithRetry(REFERENCE_TIME rt, uint32_t group, DWORD msg);
     HRESULT PackUnstructuredWithRetry(REFERENCE_TIME rt, uint32_t group, uint32_t length, const uint8_t* data);
+
+    // Drain the music buffer if dirty (PlayBuffer + Flush). Caller holds m_mutex.
+    void DrainLocked();
+    // Worker loop: every 1ms, takes m_mutex and DrainLocked()s. Exits on m_drainStop.
+    void DrainThreadProc();
 
     // Accumulate scheduling-lead stats for a single outbound message and,
     // roughly once per second, run the auto-tune controller that nudges
@@ -171,8 +201,8 @@ class DmSynth
     static constexpr uint32_t kAutoTuneUpShiftMax = 3;                 // up-step doubles up to 3x -> 2.0 ms cap
     static constexpr int32_t kAutoTuneHystVotes = 2;                   // out-of-band windows needed to trigger
     static constexpr uint32_t kAutoTuneMinSamples = 30;                // min msgs per eval window; carry over if short
-    static constexpr double kAutoTuneTargetLowMs = 1.0;  // actualLeadMin floor
-    static constexpr double kAutoTuneTargetHighMs = 7.0; // actualLeadMin ceiling
+    static constexpr double kAutoTuneTargetLowMs = 1.0;                // actualLeadMin floor
+    static constexpr double kAutoTuneTargetHighMs = 7.0;               // actualLeadMin ceiling
     static constexpr uint32_t kAutoTuneFreezeSeconds = 30;
 
     // DLS Management
@@ -190,6 +220,23 @@ class DmSynth
     std::mutex m_mutex;
     bool m_initialized = false;
     bool m_comInitialized = false;
+
+    // Monotonic floor for Pack rt: each Pack uses max(requestedRt, m_lastPackedRt+1)
+    // so simultaneous or out-of-order requests still arrive at the port scheduler
+    // in deterministic call order (100ns granularity). Protected by m_mutex.
+    REFERENCE_TIME m_lastPackedRt = 0;
+
+    // Settling gap inserted after GS Reset.
+    static constexpr REFERENCE_TIME kGsResetSettleRt = 1; // 100 ns
+
+    // Lazy-flush state. Steady-state SendMidiMessage / SendSysEx only Pack and
+    // flip m_bufferDirty; the drain thread wakes every 1ms and does the
+    // PlayBuffer + Flush. Burst paths (AllSoundOff, ResetAllState, etc.) call
+    // DrainLocked() synchronously at end of their Pack loop for immediacy.
+    bool m_bufferDirty = false;
+    std::thread m_drainThread;
+    std::atomic<bool> m_drainStop{false};
+    std::condition_variable m_drainCv;
 
     // Guards both the pending stats line (m_statsLineBuf/Ready) and the
     // translate-line queue. Producers are the callback thread; consumer

@@ -84,6 +84,10 @@ On the latest versions of Windows 11, [MIDI 2.0](https://github.com/microsoft/mi
 | `--dls <path>` | Path to a DLS file (default: system `gm.dls`) |
 | `--verbose, -v` | Enable MIDI event logging on startup |
 | `--immediate` | Bypass timestamp scheduling and send events for immediate playback. Use when running alongside software like DirectMusic Producer, which can throttle DirectSound and cause scheduled playback to run slow |
+| `--no-reverb` | Disable port-level reverb effect |
+| `--no-chorus` | Disable port-level chorus effect |
+| `--no-delay` | Disable port-level delay effect |
+| `--gap-ns <ns>` | Minimum gap between events in nanoseconds (default: 100). Higher values roughly simulate MIDI cable bandwidth (e.g., 960,000 ns for a Note On at 31250 bps). |
 | `--list` | List available devices/ports and exit |
 | `--help, -h` | Show help and exit |
 

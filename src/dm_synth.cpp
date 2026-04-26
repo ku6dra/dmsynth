@@ -129,7 +129,10 @@ bool DmSynth::Initialize()
 
     HWND hwnd = GetDesktopWindow();
 
-    hr = m_pDirectSound->SetCooperativeLevel(hwnd, DSSCL_PRIORITY);
+    // DSSCL_NORMAL so we coexist cleanly with other DirectSound/DirectMusic
+    // apps. We never touch the primary buffer, so priority access buys nothing
+    // on Win10/11 (WASAPI mixes everything in shared mode anyway).
+    hr = m_pDirectSound->SetCooperativeLevel(hwnd, DSSCL_NORMAL);
     if (FAILED(hr))
     {
         fwprintf(stderr, L"SetCooperativeLevel failed: 0x%08X\n", hr);
@@ -192,6 +195,17 @@ bool DmSynth::CreateSynthPort(const GUID& portGuid, const SynthConfig& config)
     if (!m_initialized)
         return false;
 
+    // Stop any prior drain worker from a previous port before we release the
+    // buffer/port it was touching.
+    if (m_drainThread.joinable())
+    {
+        m_drainStop.store(true, std::memory_order_release);
+        m_drainCv.notify_all();
+        m_drainThread.join();
+    }
+    m_bufferDirty = false;
+    m_lastPackedRt = 0;
+
     if (m_pLatencyClock)
     {
         m_pLatencyClock->Release();
@@ -231,7 +245,9 @@ bool DmSynth::CreateSynthPort(const GUID& portGuid, const SynthConfig& config)
     params.dwChannelGroups = config.channelGroups;
     params.dwSampleRate = config.sampleRate;
     params.dwAudioChannels = config.audioChannels;
-    params.dwEffectFlags = DMUS_EFFECT_REVERB | DMUS_EFFECT_CHORUS | DMUS_EFFECT_DELAY;
+    params.dwEffectFlags = (config.enableReverb ? DMUS_EFFECT_REVERB : 0u) |
+                           (config.enableChorus ? DMUS_EFFECT_CHORUS : 0u) |
+                           (config.enableDelay ? DMUS_EFFECT_DELAY : 0u);
 
     HRESULT hr = S_OK;
     bool success = false;
@@ -310,6 +326,10 @@ bool DmSynth::CreateSynthPort(const GUID& portGuid, const SynthConfig& config)
         return false;
     }
 
+    // Fresh buffer: reset monotonic rt floor and dirty flag for this port.
+    m_lastPackedRt = 0;
+    m_bufferDirty = false;
+
     // Acquire the port's latency clock so we can stamp MIDI buffers with a
     // reference-time that tracks actual arrival order rather than 0.
     if (FAILED(m_pPort->GetLatencyClock(&m_pLatencyClock)))
@@ -336,6 +356,13 @@ bool DmSynth::CreateSynthPort(const GUID& portGuid, const SynthConfig& config)
         std::lock_guard<std::mutex> lock(m_mutex);
         SendDefaultEffects();
     }
+
+    // Start lazy-flush worker: drains m_pMusicBuffer every ~1ms when dirty,
+    // coalescing steady-state SendMidiMessage/SendSysEx Pack calls so we don't
+    // PlayBuffer+Flush per MIDI event.
+    m_drainStop.store(false, std::memory_order_release);
+    m_drainThread = std::thread([this] { DrainThreadProc(); });
+
     return true;
 }
 
@@ -403,13 +430,16 @@ REFERENCE_TIME DmSynth::MidiMsToRefTime(DWORD absWinmmMs)
 
 HRESULT DmSynth::PackStructuredWithRetry(REFERENCE_TIME rt, uint32_t group, DWORD msg)
 {
-    HRESULT hr = m_pMusicBuffer->PackStructured(rt, group, msg);
+    REFERENCE_TIME actualRt = (std::max)(rt, m_lastPackedRt + m_activeConfig.interMessageGapRt);
+    m_lastPackedRt = actualRt;
+    HRESULT hr = m_pMusicBuffer->PackStructured(actualRt, group, msg);
     if (FAILED(hr))
     {
         // Buffer likely full — drain and retry once.
         m_pPort->PlayBuffer(m_pMusicBuffer);
         m_pMusicBuffer->Flush();
-        hr = m_pMusicBuffer->PackStructured(rt, group, msg);
+        m_bufferDirty = false;
+        hr = m_pMusicBuffer->PackStructured(actualRt, group, msg);
         m_tsStats.retryCount++;
     }
     return hr;
@@ -417,15 +447,45 @@ HRESULT DmSynth::PackStructuredWithRetry(REFERENCE_TIME rt, uint32_t group, DWOR
 
 HRESULT DmSynth::PackUnstructuredWithRetry(REFERENCE_TIME rt, uint32_t group, uint32_t length, const uint8_t* data)
 {
-    HRESULT hr = m_pMusicBuffer->PackUnstructured(rt, group, length, (LPBYTE)data);
+    REFERENCE_TIME actualRt = (std::max)(rt, m_lastPackedRt + m_activeConfig.interMessageGapRt);
+    m_lastPackedRt = actualRt;
+    HRESULT hr = m_pMusicBuffer->PackUnstructured(actualRt, group, length, (LPBYTE)data);
     if (FAILED(hr))
     {
         m_pPort->PlayBuffer(m_pMusicBuffer);
         m_pMusicBuffer->Flush();
-        hr = m_pMusicBuffer->PackUnstructured(rt, group, length, (LPBYTE)data);
+        m_bufferDirty = false;
+        hr = m_pMusicBuffer->PackUnstructured(actualRt, group, length, (LPBYTE)data);
         m_tsStats.retryCount++;
     }
     return hr;
+}
+
+void DmSynth::DrainLocked()
+{
+    if (!m_bufferDirty || !m_pPort || !m_pMusicBuffer)
+        return;
+    m_pPort->PlayBuffer(m_pMusicBuffer);
+    m_pMusicBuffer->Flush();
+    m_bufferDirty = false;
+}
+
+void DmSynth::DrainThreadProc()
+{
+    // Separate mutex for the cv wait so we never hold m_mutex while sleeping.
+    std::mutex waitMtx;
+    while (!m_drainStop.load(std::memory_order_acquire))
+    {
+        {
+            std::unique_lock<std::mutex> wlk(waitMtx);
+            m_drainCv.wait_for(wlk, std::chrono::milliseconds(1),
+                               [this] { return m_drainStop.load(std::memory_order_acquire); });
+        }
+        if (m_drainStop.load(std::memory_order_acquire))
+            break;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        DrainLocked();
+    }
 }
 
 void DmSynth::AccumulateTimestampStats(REFERENCE_TIME scheduledRt, bool isSysEx)
@@ -799,9 +859,10 @@ bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint
             uint32_t fLSB = (finalPatch >> 8) & 0xFF;
             uint32_t fProg = finalPatch & 0xFF;
 
+            wchar_t groupChar = L'A' + static_cast<wchar_t>(channelGroup - 1);
             EnqueueTranslateLine(
-                L"[Translate] Program Change ch%u: Bank %u/%u Prog %u → Bank %u/%u Prog %u (fallback L%d)", channel + 1,
-                bankMSB, bankLSB, program, fMSB, fLSB, fProg, fallbackLevel);
+                L"[Translate] Program Change %lc%02u: Bank %3u/%3u Prog %3u → Bank %3u/%3u Prog %3u (fallback L%d)",
+                groupChar, channel + 1, bankMSB, bankLSB, program, fMSB, fLSB, fProg, fallbackLevel);
 
             // Re-route to fallback:
             // 1. Send Bank Select
@@ -811,8 +872,10 @@ bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint
             // 2. Send Program Change
             PackStructuredWithRetry(timestamp, channelGroup, (0xC0 | channel) | (fProg << 8));
 
-            m_pPort->PlayBuffer(m_pMusicBuffer);
-            m_pMusicBuffer->Flush();
+            // Burst: drain the 3-message group synchronously so the program
+            // change takes effect before any subsequent note-on arrives.
+            m_bufferDirty = true;
+            DrainLocked();
 
             // Update internal state
             m_bankMSB[idx] = (uint8_t)fMSB;
@@ -843,11 +906,8 @@ bool DmSynth::SendMidiMessage(uint8_t status, uint8_t data1, uint8_t data2, uint
     if (FAILED(hr))
         return false;
 
-    hr = m_pPort->PlayBuffer(m_pMusicBuffer);
-    if (FAILED(hr))
-        return false;
-
-    m_pMusicBuffer->Flush(); // reset buffer for next message
+    // Lazy flush: mark dirty and let DrainThreadProc coalesce within ~1ms.
+    m_bufferDirty = true;
     return true;
 }
 
@@ -882,8 +942,13 @@ bool DmSynth::SendSysEx(const uint8_t* data, uint32_t length, uint32_t channelGr
             EnqueueTranslateLine(L"[Translate] XG System On → GS Reset");
         static const uint8_t gsResetMsg[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7};
         PackUnstructuredWithRetry(timestamp, channelGroup, sizeof(gsResetMsg), gsResetMsg);
-        m_pPort->PlayBuffer(m_pMusicBuffer);
-        m_pMusicBuffer->Flush();
+        // Push the monotonic rt floor 50ms forward so subsequent Pack calls are
+        // clamped past this gap. Scheduled-mode initialization breathing room.
+        m_lastPackedRt += kGsResetSettleRt;
+        // Burst: drain synchronously so the reset lands before ResetInternalState
+        // re-applies defaults (which pack further SysEx into the same buffer).
+        m_bufferDirty = true;
+        DrainLocked();
 
         ResetInternalState();
         return true;
@@ -930,7 +995,7 @@ bool DmSynth::SendSysEx(const uint8_t* data, uint32_t length, uint32_t channelGr
             uint8_t xgLsb = (length >= 10) ? data[8] : 0;
             uint8_t gsMacro = MapXgReverbToGs(xgMsb, xgLsb);
             EnqueueTranslateLine(L"[Translate] XG Reverb %02X/%02X → GS Reverb macro %02X", xgMsb, xgLsb, gsMacro);
-            SendGsReverbMacro(gsMacro);
+            SendGsMacro(0x30, gsMacro);
             return true;
         }
         if (addrLow == 0x20)
@@ -939,7 +1004,7 @@ bool DmSynth::SendSysEx(const uint8_t* data, uint32_t length, uint32_t channelGr
             uint8_t xgLsb = (length >= 10) ? data[8] : 0;
             uint8_t gsMacro = MapXgChorusToGs(xgMsb, xgLsb);
             EnqueueTranslateLine(L"[Translate] XG Chorus %02X/%02X → GS Chorus macro %02X", xgMsb, xgLsb, gsMacro);
-            SendGsChorusMacro(gsMacro);
+            SendGsMacro(0x38, gsMacro);
             return true;
         }
     }
@@ -950,11 +1015,8 @@ bool DmSynth::SendSysEx(const uint8_t* data, uint32_t length, uint32_t channelGr
     if (FAILED(hr))
         return false;
 
-    hr = m_pPort->PlayBuffer(m_pMusicBuffer);
-    if (FAILED(hr))
-        return false;
-
-    m_pMusicBuffer->Flush();
+    // Lazy flush: mark dirty and let DrainThreadProc coalesce within ~1ms.
+    m_bufferDirty = true;
     return true;
 }
 
@@ -968,9 +1030,10 @@ void DmSynth::AllSoundOffLocked()
     {
         for (uint8_t ch = 0; ch < 16; ch++)
             PackStructuredWithRetry(0, group, (0xB0 | ch) | (120 << 8) | (0 << 16));
-        m_pPort->PlayBuffer(m_pMusicBuffer);
-        m_pMusicBuffer->Flush();
     }
+    // Burst: one drain for all channels × all groups.
+    m_bufferDirty = true;
+    DrainLocked();
 }
 
 void DmSynth::AllSoundOff()
@@ -990,54 +1053,41 @@ void DmSynth::ResetAllState()
     // 1. All Sound Off on every channel to silence voices immediately
     AllSoundOffLocked();
 
-    // 2. GS Reset (F0 41 10 42 12 40 00 7F 00 41 F7)
-    //    Resets all GS parameters: tuning, pitch bend, controllers, programs, effects, etc.
+    // 2. GS Reset on every active channel group — each group's patch cache
+    //    is independent, so resetting only group 1 would leave CH17-32 with
+    //    stale programs, pitch bend, controllers, etc.
     static const uint8_t gsResetMsg[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7};
-    PackUnstructuredWithRetry(0, 1, sizeof(gsResetMsg), gsResetMsg);
-    m_pPort->PlayBuffer(m_pMusicBuffer);
-    m_pMusicBuffer->Flush();
+    uint32_t groups = m_activeConfig.channelGroups > 0 ? m_activeConfig.channelGroups : 1;
+    for (uint32_t group = 1; group <= groups; group++)
+    {
+        PackUnstructuredWithRetry(0, group, sizeof(gsResetMsg), gsResetMsg);
+    }
+    // Push the monotonic rt floor 50ms past the last GS Reset so the pending
+    // SendDefaultEffects (invoked via ResetInternalState below) and any caller
+    // MIDI event arriving next are clamped past the reset-settling window.
+    m_lastPackedRt += kGsResetSettleRt;
+    // Burst: one drain for GS Reset across every group.
+    m_bufferDirty = true;
+    DrainLocked();
 
     // 3. Reset internal tracking state + re-apply custom defaults
     ResetInternalState();
 }
 
-// Send GS Reverb Macro SysEx: F0 41 10 42 12 40 01 30 <type> <checksum> F7
+// Send a GS Patch Part Parameter macro SysEx: F0 41 10 42 12 40 01 <addr> <type> <checksum> F7
+//   addr 0x30 = Reverb Macro, 0x38 = Chorus Macro, 0x50 = Delay Macro
+//   Delay types: 00=Delay1..03=Delay4, 04=Pan Delay1..07=Pan Delay4,
+//                08=Delay to Reverb, 09=Pan Repeat
 // Caller must hold m_mutex.
-void DmSynth::SendGsReverbMacro(uint8_t type)
+void DmSynth::SendGsMacro(uint8_t addr, uint8_t type, uint32_t group)
 {
-    uint8_t sum = 0x40 + 0x01 + 0x30 + type;
+    uint8_t sum = 0x40 + 0x01 + addr + type;
     uint8_t checksum = (128 - (sum & 0x7F)) & 0x7F;
-    uint8_t sysex[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x01, 0x30, type, checksum, 0xF7};
-    PackUnstructuredWithRetry(0, 1, sizeof(sysex), sysex);
-    m_pPort->PlayBuffer(m_pMusicBuffer);
-    m_pMusicBuffer->Flush();
-}
-
-// Send GS Chorus Macro SysEx: F0 41 10 42 12 40 01 38 <type> <checksum> F7
-// Caller must hold m_mutex.
-void DmSynth::SendGsChorusMacro(uint8_t type)
-{
-    uint8_t sum = 0x40 + 0x01 + 0x38 + type;
-    uint8_t checksum = (128 - (sum & 0x7F)) & 0x7F;
-    uint8_t sysex[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x01, 0x38, type, checksum, 0xF7};
-    PackUnstructuredWithRetry(0, 1, sizeof(sysex), sysex);
-    m_pPort->PlayBuffer(m_pMusicBuffer);
-    m_pMusicBuffer->Flush();
-}
-
-// Send GS Delay Macro SysEx: F0 41 10 42 12 40 01 50 <type> <checksum> F7
-// type: 00=Delay1, 01=Delay2, 02=Delay3, 03=Delay4,
-//       04=Pan Delay1, 05=Pan Delay2, 06=Pan Delay3, 07=Pan Delay4,
-//       08=Delay to Reverb, 09=Pan Repeat
-// Caller must hold m_mutex.
-void DmSynth::SendGsDelayMacro(uint8_t type)
-{
-    uint8_t sum = 0x40 + 0x01 + 0x50 + type;
-    uint8_t checksum = (128 - (sum & 0x7F)) & 0x7F;
-    uint8_t sysex[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x01, 0x50, type, checksum, 0xF7};
-    PackUnstructuredWithRetry(0, 1, sizeof(sysex), sysex);
-    m_pPort->PlayBuffer(m_pMusicBuffer);
-    m_pMusicBuffer->Flush();
+    uint8_t sysex[] = {0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x01, addr, type, checksum, 0xF7};
+    PackUnstructuredWithRetry(0, group, sizeof(sysex), sysex);
+    // Burst: drain this macro synchronously — callers expect it applied before return.
+    m_bufferDirty = true;
+    DrainLocked();
 }
 
 // Reset internal tracking state and re-apply custom defaults. Caller must hold m_mutex.
@@ -1049,20 +1099,54 @@ void DmSynth::ResetInternalState()
     m_drumChannel[9] = true;  // Group 1, CH10
     m_drumChannel[25] = true; // Group 2, CH10
     SendDefaultEffects();
+    SendDefaultPitchBendRange();
+}
+
+// Reset Pitch Bend Sensitivity to ±2 semitones on every channel of every
+// active group via RPN 00 00 / Data Entry MSB = 2. The MS GS Wavetable Synth
+// ignores Data Entry LSB (cents) for this RPN, so we don't bother sending it.
+// Caller must hold m_mutex.
+void DmSynth::SendDefaultPitchBendRange()
+{
+    uint32_t groups = m_activeConfig.channelGroups > 0 ? m_activeConfig.channelGroups : 1;
+    for (uint32_t group = 1; group <= groups; group++)
+    {
+        for (uint8_t ch = 0; ch < 16; ch++)
+        {
+            // RPN MSB / LSB = 00 00 (Pitch Bend Sensitivity).
+            PackStructuredWithRetry(0, group, (0xB0 | ch) | (101 << 8) | (0 << 16));
+            PackStructuredWithRetry(0, group, (0xB0 | ch) | (100 << 8) | (0 << 16));
+            // Data Entry MSB = 2 semitones.
+            PackStructuredWithRetry(0, group, (0xB0 | ch) | (6 << 8) | (2 << 16));
+        }
+    }
+    // Burst: drain synchronously so the range is applied before any subsequent
+    // note-on / pitch-bend arrives at the port.
+    m_bufferDirty = true;
+    DrainLocked();
 }
 
 // Set default GS effect types. Caller must hold m_mutex.
 void DmSynth::SendDefaultEffects()
 {
-    // GM Master Volume = 100 (Universal Real Time SysEx: F0 7F 7F 04 01 <LSB> <MSB> F7)
     static const uint8_t masterVolMsg[] = {0xF0, 0x7F, 0x7F, 0x04, 0x01, 0x00, 0x64, 0xF7};
-    PackUnstructuredWithRetry(0, 1, sizeof(masterVolMsg), masterVolMsg);
-    m_pPort->PlayBuffer(m_pMusicBuffer);
-    m_pMusicBuffer->Flush();
+    uint32_t groups = m_activeConfig.channelGroups > 0 ? m_activeConfig.channelGroups : 1;
+    for (uint32_t group = 1; group <= groups; group++)
+    {
+        PackUnstructuredWithRetry(0, group, sizeof(masterVolMsg), masterVolMsg);
+        // Drain master-vol before the per-group SendGsMacro calls — each macro
+        // self-drains, so piggy-backing here avoids a stray Pack left over in
+        // the buffer if none of the effect flags are set.
+        m_bufferDirty = true;
+        DrainLocked();
 
-    SendGsReverbMacro(0x04); // Hall2 (GS default)
-    SendGsChorusMacro(0x02); // Chorus3 (GS default)
-    SendGsDelayMacro(0x00);  // Delay1 (GS default)
+        if (m_activeConfig.enableReverb)
+            SendGsMacro(0x30, 0x04, group); // Reverb Hall2 (GS default)
+        if (m_activeConfig.enableChorus)
+            SendGsMacro(0x38, 0x02, group); // Chorus3 (GS default)
+        if (m_activeConfig.enableDelay)
+            SendGsMacro(0x50, 0x00, group); // Delay1 (GS default)
+    }
 }
 
 bool DmSynth::TryDrainStatsLine(wchar_t* out, size_t cap)
@@ -1113,7 +1197,16 @@ void DmSynth::Shutdown()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         AllSoundOffLocked();
+        // AllSoundOffLocked already drains synchronously, but flush once more
+        // in case any lazy-flush Pack is still dirty from in-flight callbacks.
+        DrainLocked();
     }
+
+    // Stop the lazy-flush worker before we release the buffer / port below.
+    m_drainStop.store(true, std::memory_order_release);
+    m_drainCv.notify_all();
+    if (m_drainThread.joinable())
+        m_drainThread.join();
 
     // Give the synth time to render the All Sound Off so trailing audio
     // doesn't bleed into the next session.
